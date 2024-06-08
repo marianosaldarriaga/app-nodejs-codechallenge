@@ -1,25 +1,125 @@
 version: "3.7"
+
+x-common-variables: &common-variables
+  TZ: America/Lima
+
 services:
+
+  # PostgreSQL
   postgres:
-    image: postgres:14
-    ports:
-      - "5432:5432"
+    image: postgres:16.3
+    container_name: postgres
+    restart: always
+    networks:
+      - db-net
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    env_file:
+      - variables.env
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      <<: *common-variables
+      PGDATA: "/var/lib/postgresql/data/pgdata"
+
+  # Redis
+  redis:
+    image: redis:7.2
+    container_name: redis
+    restart: always
+    networks:
+      - db-net
+    environment:
+      <<: *common-variables
+      REDIS_PASSWORD: "my-password"
+      REDIS_PORT: 6379
+      REDIS_DATABASES: 16
+
+  # Kafka and Zookeeper
   zookeeper:
-    image: confluentinc/cp-zookeeper:5.5.3
+    image: zookeeper:3.9
+    restart: always
+    networks:
+      - api-net
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOO_MY_ID: 1
+      ZOO_PORT: 2181
   kafka:
-    image: confluentinc/cp-enterprise-kafka:5.5.3
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    restart: always
+    networks:
+      - api-net
     depends_on: [zookeeper]
     environment:
+      <<: *common-variables
+      KAFKA_ADVERTISED_LISTENERS: LISTENER_DOCKER_INTERNAL://kafka:29092,LISTENER_DOCKER_EXTERNAL://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: LISTENER_DOCKER_INTERNAL:PLAINTEXT,LISTENER_DOCKER_EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: LISTENER_DOCKER_INTERNAL
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CREATE_TOPICS: transactions:1:1:compact
       KAFKA_BROKER_ID: 1
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_JMX_PORT: 9991
+
+  # Data API
+  data-api:
+    build:
+      context: data-api
+      dockerfile: Dockerfile
+    container_name: data-api
+    restart: always
+    depends_on: [postgres, redis]
+    volumes:
+      - ./variables.env:/variables.env
+    networks:
+      - db-net
+      - api-net
+
+  # Anti-Fraud API
+  anti-fraud-api:
+    build:
+      context: anti-fraud-api
+      dockerfile: Dockerfile
+    container_name: anti-fraud-api
+    restart: always
+    depends_on: [kafka, data-api, transactions-api]
+    volumes:
+      - ./variables.env:/variables.env
+    networks:
+      - api-net
+
+  # Transactions API
+  transactions-api:
+    build:
+      context: transactions-api
+      dockerfile: Dockerfile
+    container_name: transactions-api
+    restart: always
+    depends_on: [kafka, data-api]
+    volumes:
+      - ./variables.env:/variables.env
+    networks:
+      - api-net
+      - exposed-net
+
+  # Exposed API Gateway
+  api-gateway:
+    build:
+      context: api-gateway
+      dockerfile: Dockerfile
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    container_name: api-gateway
+    restart: always
+    depends_on: [transactions-api]
     ports:
-      - 9092:9092
+      - 8080:80
+    networks:
+      - exposed-net
+
+networks:
+  db-net:
+    driver: bridge
+  api-net:
+    driver: bridge
+  exposed-net:
+    driver: bridge
